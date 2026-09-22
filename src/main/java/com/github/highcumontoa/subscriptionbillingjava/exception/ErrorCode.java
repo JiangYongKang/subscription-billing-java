@@ -1,0 +1,25 @@
+package com.github.highcumontoa.subscriptionbillingjava.exception;
+
+/**
+ * 可区分的拒绝/失败原因。每种业务违例使用独立的错误码，便于测试断言与日志解释。
+ */
+public enum ErrorCode {
+    PLAN_NOT_FOUND,
+    SUBSCRIPTION_NOT_FOUND,
+    ILLEGAL_STATE_TRANSITION,
+    PLAN_UNCHANGED,
+    EFFECTIVE_TIME_INVALID,
+    DOWNGRADE_QUOTA_EXCEEDED,
+    CONCURRENT_MODIFICATION,
+    DUPLICATE_EVENT,
+    EVENT_TOO_OLD,
+    EVENT_OUT_OF_ORDER_WINDOW,
+    QUANTITY_INVALID,
+    INVOICE_NOT_FOUND,
+    INVOICE_PERIOD_CONFLICT,
+    INVOICE_ALREADY_PAID,
+    INVOICE_NOT_CONFIRMABLE,
+    PAYMENT_DECLINED,
+    RETRY_NOT_DUE,
+    RETRY_EXHAUSTED
+}
