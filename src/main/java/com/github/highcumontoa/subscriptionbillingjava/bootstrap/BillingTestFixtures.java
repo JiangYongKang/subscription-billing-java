@@ -53,6 +53,8 @@ public final class BillingTestFixtures {
                 planRepository, usageService, pricingService, gateway, clock);
         this.dunningService = new DunningService(invoiceRepository, gateway, clock, billingService);
         this.dunningService.configure(DEFAULT_POLICY);
+        // 迟到补报闭环：用量侧接受迟到事件后自动联动计费侧重算/补差
+        this.usageService.setLateUsageHandler(billingService::processLateUsage);
     }
 
     public static BillingTestFixtures create() {

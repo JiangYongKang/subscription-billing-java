@@ -1,6 +1,7 @@
 package com.github.highcumontoa.subscriptionbillingjava.service;
 
 import com.github.highcumontoa.subscriptionbillingjava.billing.Invoice;
+import com.github.highcumontoa.subscriptionbillingjava.billing.InvoiceKind;
 import com.github.highcumontoa.subscriptionbillingjava.billing.InvoiceStatus;
 import com.github.highcumontoa.subscriptionbillingjava.billing.LocalPaymentGateway;
 import com.github.highcumontoa.subscriptionbillingjava.billing.RetryPolicy;
@@ -17,7 +18,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 账单生成与收款确认服务。
@@ -140,10 +143,10 @@ public class BillingService {
             invoice.setAttempt(0);
             invoice.setNextRetryAt(0L);
             invoice.getLineItems().addAll(lineItems);
-            invoiceRepository.save(invoice);
-
             List<UsageEvent> basis = usageService.aggregatedEvents(
                     subscriptionId, periodStart, periodEnd);
+            basis.forEach(e -> invoice.getBilledEventIds().add(e.eventId()));
+            invoiceRepository.save(invoice);
             log.info("[billing] generate decision=CREATED id={} sub={} period=[{},{}) "
                             + "planFee={}c includedUnits={} usedUnits={} overageUnits={} "
                             + "usageFee={}c total={}c basisEvents={} conserved(total=plan+usage)={}",
@@ -216,5 +219,233 @@ public class BillingService {
     private BillingException reject(ErrorCode code, String message) {
         log.warn("[billing] rejected code={} detail={}", code, message);
         return new BillingException(code, message);
+    }
+
+    // ------------------------------------------------------------------
+    // 迟到用量补报闭环
+    // ------------------------------------------------------------------
+
+    /** 迟到补报处理结果。 */
+    public record LateUsageOutcome(Kind kind, Invoice invoice, long deltaCents, String detail) {
+        public enum Kind {
+            /** 账期尚未出账：补报只进入用量汇总，出账时自然被计入。 */
+            NO_INVOICE_YET,
+            /** 账单未结清（PENDING/DUNNING）：金额已按全部事件重算并更新。 */
+            RECALCULATED,
+            /** 账单已结清（PAID/FAILED 终态）：已生成补差调整单。 */
+            ADJUSTMENT_CREATED,
+            /** 无新增应收（无新迟到用量或差额为零）：不产生任何单据。 */
+            NO_CHANGE
+        }
+    }
+
+    /**
+     * 迟到用量补报的统一入口（由 UsageService 在接受迟到事件后回调，也可显式触发）。
+     *
+     * <p>按账期账单状态分流（全程在订阅级锁内，与收款确认互斥）：
+     * <ul>
+     *   <li>未出账：NO_INVOICE_YET，不生成任何单据；</li>
+     *   <li>PENDING/DUNNING：按当前全部事件重算用量费并更新账单总额，
+     *       重算审计（差异来源事件集合）写入 {@link Invoice#getRecalcAudits()}；</li>
+     *   <li>PAID/FAILED 终态：差额 = 当前口径应收 − 已出账（原账单 + 既有调整单），
+     *       差额 &gt; 0 才生成 ADJUSTMENT 补差单；差额 ≤ 0 不生成（幂等：
+     *       同一批补报重复/并发触发不会重复计费）。</li>
+     * </ul>
+     */
+    public LateUsageOutcome processLateUsage(String subscriptionId, long periodStart,
+                                             UsageEvent triggerEvent) {
+        return invoiceRepository.withLock(subscriptionId, () -> {
+            var existing = invoiceRepository.findBySubscriptionAndPeriod(subscriptionId, periodStart);
+            if (existing.isEmpty()) {
+                log.info("[billing] lateUsage sub={} period={} trigger={} decision=NO_INVOICE_YET "
+                                + "(事件已入汇总，出账时自然计入)",
+                        subscriptionId, periodStart, triggerEvent.eventId());
+                return new LateUsageOutcome(LateUsageOutcome.Kind.NO_INVOICE_YET, null, 0L,
+                        "账期未出账，补报仅进入用量汇总");
+            }
+            Invoice inv = existing.get();
+            if (inv.getStatus() == InvoiceStatus.PENDING || inv.getStatus() == InvoiceStatus.DUNNING) {
+                return recalculateOpenInvoice(inv, triggerEvent);
+            }
+            return createAdjustmentIfNeeded(inv, triggerEvent);
+        });
+    }
+
+    /** 未结清账单重算：用量费按当前全部事件重算，套餐费保持不变（分段已冻结）。 */
+    private LateUsageOutcome recalculateOpenInvoice(Invoice inv, UsageEvent trigger) {
+        long includedUnits = inv.getLineItems().stream()
+                .mapToLong(Invoice.LineItem::includedUnits).sum();
+        long usedUnits = usageService.aggregate(
+                inv.getSubscriptionId(), inv.getPeriodStart(), inv.getPeriodEnd());
+        long overageUnits = Math.max(0L, usedUnits - includedUnits);
+        Plan billingPlan = planRepository.requireByCode(billingPlanCode(inv));
+        long newUsageFee = pricingService.overageFee(billingPlan.overageTiers(), overageUnits);
+        long newTotal = inv.getPlanFeeCents() + newUsageFee;
+        if (newTotal == inv.getTotalCents()) {
+            log.info("[billing] lateUsage recalc id={} decision=NO_CHANGE total={}c",
+                    inv.getId(), inv.getTotalCents());
+            return new LateUsageOutcome(LateUsageOutcome.Kind.NO_CHANGE, inv, 0L,
+                    "重算金额与原金额一致");
+        }
+        List<String> basisEventIds = usageService.aggregatedEvents(
+                        inv.getSubscriptionId(), inv.getPeriodStart(), inv.getPeriodEnd())
+                .stream().map(UsageEvent::eventId).toList();
+        long oldUsageFee = inv.getUsageFeeCents();
+        long oldTotal = inv.getTotalCents();
+        inv.setUsageFeeCents(newUsageFee);
+        inv.setTotalCents(newTotal);
+        inv.getRecalcAudits().add(new Invoice.RecalcAudit(
+                clock.nowMillis(), trigger.eventId(), oldUsageFee, newUsageFee,
+                oldTotal, newTotal, basisEventIds));
+        inv.getBilledEventIds().clear();
+        inv.getBilledEventIds().addAll(basisEventIds);
+        invoiceRepository.save(inv);
+        log.info("[billing] lateUsage recalc id={} decision=RECALCULATED trigger={} "
+                        + "usedUnits={} includedUnits={} overageUnits={} "
+                        + "usageFee {}c -> {}c total {}c -> {}c basisEvents={}",
+                inv.getId(), trigger.eventId(), usedUnits, includedUnits, overageUnits,
+                oldUsageFee, newUsageFee, oldTotal, newTotal, basisEventIds);
+        return new LateUsageOutcome(LateUsageOutcome.Kind.RECALCULATED, inv,
+                newTotal - oldTotal, "账单未结清，已按全部事件重算");
+    }
+
+    /** 已结清账期补差：差额 = 当前口径应收 − 已出账总额，差额 &gt; 0 才落调整单。 */
+    private LateUsageOutcome createAdjustmentIfNeeded(Invoice original, UsageEvent trigger) {
+        String subId = original.getSubscriptionId();
+        long periodStart = original.getPeriodStart();
+        long includedUnits = original.getLineItems().stream()
+                .mapToLong(Invoice.LineItem::includedUnits).sum();
+        long usedUnits = usageService.aggregate(subId, periodStart, original.getPeriodEnd());
+        long overageUnits = Math.max(0L, usedUnits - includedUnits);
+        Plan billingPlan = planRepository.requireByCode(billingPlanCode(original));
+        long expectedUsageFee = pricingService.overageFee(billingPlan.overageTiers(), overageUnits);
+        long expectedTotal = original.getPlanFeeCents() + expectedUsageFee;
+
+        List<Invoice> adjustments = invoiceRepository.findAdjustments(subId, periodStart);
+        long billedTotal = original.getTotalCents()
+                + adjustments.stream().mapToLong(Invoice::getTotalCents).sum();
+        long delta = expectedTotal - billedTotal;
+        if (delta <= 0L) {
+            log.info("[billing] lateUsage adjust id={} decision=NO_CHANGE expected={}c "
+                            + "billed={}c delta={}c (无新增应收，不生成补差单)",
+                    original.getId(), expectedTotal, billedTotal, delta);
+            return new LateUsageOutcome(LateUsageOutcome.Kind.NO_CHANGE, original, 0L,
+                    "无新增应收差额，不生成补差调整单");
+        }
+
+        // 补差来源：窗口内未被原账单（生成/重算时已计费事件）与既有调整单覆盖的事件
+        Set<String> covered = new HashSet<>(original.getBilledEventIds());
+        adjustments.forEach(a -> covered.addAll(a.getSourceEventIds()));
+        List<String> sourceEventIds = usageService.aggregatedEvents(
+                        subId, periodStart, original.getPeriodEnd())
+                .stream().map(UsageEvent::eventId)
+                .filter(id -> !covered.contains(id))
+                .toList();
+
+        Invoice adj = new Invoice();
+        adj.setId("ADJ-" + subId + "-" + periodStart + "-" + (adjustments.size() + 1));
+        adj.setSubscriptionId(subId);
+        adj.setPeriodStart(periodStart);
+        adj.setPeriodEnd(original.getPeriodEnd());
+        adj.setGeneratedAt(clock.nowMillis());
+        adj.setKind(InvoiceKind.ADJUSTMENT);
+        adj.setLinkedInvoiceId(original.getId());
+        adj.setPlanFeeCents(0L);
+        adj.setUsageFeeCents(delta);
+        adj.setTotalCents(delta);
+        adj.setStatus(InvoiceStatus.PENDING);
+        adj.setAttempt(0);
+        adj.setNextRetryAt(0L);
+        adj.getSourceEventIds().addAll(sourceEventIds);
+        invoiceRepository.save(adj);
+        log.info("[billing] lateUsage adjust decision=ADJUSTMENT_CREATED id={} linkedTo={} "
+                        + "trigger={} delta={}c (expected={}c billed={}c) sourceEvents={}",
+                adj.getId(), original.getId(), trigger.eventId(), delta,
+                expectedTotal, billedTotal, sourceEventIds);
+        return new LateUsageOutcome(LateUsageOutcome.Kind.ADJUSTMENT_CREATED, adj, delta,
+                "账期已结清，生成补差调整单");
+    }
+
+    /** 账期计费口径：覆盖账期内最后时刻的套餐分段（与出账时的开口段一致）。 */
+    private String billingPlanCode(Invoice inv) {
+        Subscription s = subscriptionRepository.requireById(inv.getSubscriptionId());
+        String code = null;
+        for (PlanSegment seg : s.getSegments()) {
+            if (seg.start() < inv.getPeriodEnd()) {
+                code = seg.planCode();
+            }
+        }
+        if (code == null) {
+            throw reject(ErrorCode.ILLEGAL_STATE_TRANSITION,
+                    "账期内不存在套餐分段: sub=" + inv.getSubscriptionId()
+                            + " period=[" + inv.getPeriodStart() + "," + inv.getPeriodEnd() + ")");
+        }
+        return code;
+    }
+
+    /** 对账结果：原账单 + 补差调整单 与 当前口径应收总额的核对。 */
+    public record Reconciliation(String subscriptionId, long periodStart,
+                                 Invoice originalInvoice, List<Invoice> adjustments,
+                                 long originalAmountCents, long adjustmentTotalCents,
+                                 long expectedTotalCents, long discrepancyCents) {
+    }
+
+    /**
+     * 对账：对任一订阅的任一账期，给出
+     * “原账单金额 + 已产生补差金额 = 当前口径应收总额”的核对结果。
+     * 已出账账期差额恒为 0 且可复现；未出账账期 discrepancy 即当前应收（尚未出账）。
+     */
+    public Reconciliation reconcile(String subscriptionId, long periodStart) {
+        Subscription s = subscriptionRepository.requireById(subscriptionId);
+        long periodEnd = SubscriptionService.nextPeriodEnd(periodStart);
+        var existing = invoiceRepository.findBySubscriptionAndPeriod(subscriptionId, periodStart);
+        List<Invoice> adjustments = invoiceRepository.findAdjustments(subscriptionId, periodStart);
+
+        long planFee;
+        long includedUnits;
+        if (existing.isPresent()) {
+            planFee = existing.get().getPlanFeeCents();
+            includedUnits = existing.get().getLineItems().stream()
+                    .mapToLong(Invoice.LineItem::includedUnits).sum();
+        } else {
+            planFee = 0L;
+            includedUnits = 0L;
+            for (PlanSegment seg : s.getSegments()) {
+                long segEnd = seg.end() == null ? periodEnd : seg.end();
+                long lo = Math.max(seg.start(), periodStart);
+                long hi = Math.min(segEnd, periodEnd);
+                if (hi <= lo) {
+                    continue;
+                }
+                Plan plan = planRepository.requireByCode(seg.planCode());
+                planFee += pricingService.proratedMonthlyPrice(
+                        plan.monthlyPriceCents(), lo, hi, periodStart, periodEnd);
+                includedUnits += pricingService.proratedIncludedUnits(
+                        plan.includedUnits(), lo, hi, periodStart, periodEnd);
+            }
+        }
+        long usedUnits = usageService.aggregate(subscriptionId, periodStart, periodEnd);
+        long overageUnits = Math.max(0L, usedUnits - includedUnits);
+        String planCode = null;
+        for (PlanSegment seg : s.getSegments()) {
+            if (seg.start() < periodEnd) {
+                planCode = seg.planCode();
+            }
+        }
+        long usageFee = planCode == null ? 0L
+                : pricingService.overageFee(
+                        planRepository.requireByCode(planCode).overageTiers(), overageUnits);
+        long expectedTotal = planFee + usageFee;
+
+        long originalAmount = existing.map(Invoice::getTotalCents).orElse(0L);
+        long adjustmentTotal = adjustments.stream().mapToLong(Invoice::getTotalCents).sum();
+        long discrepancy = expectedTotal - originalAmount - adjustmentTotal;
+        log.info("[billing] reconcile sub={} period=[{},{}) original={}c adjustments={}c "
+                        + "expected={}c (planFee={}c usageFee={}c usedUnits={} includedUnits={}) "
+                        + "discrepancy={}c",
+                subscriptionId, periodStart, periodEnd, originalAmount, adjustmentTotal,
+                expectedTotal, planFee, usageFee, usedUnits, includedUnits, discrepancy);
+        return new Reconciliation(subscriptionId, periodStart, existing.orElse(null),
+                adjustments, originalAmount, adjustmentTotal, expectedTotal, discrepancy);
     }
 }

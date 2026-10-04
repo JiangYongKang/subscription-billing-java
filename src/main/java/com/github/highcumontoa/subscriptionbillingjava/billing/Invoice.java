@@ -15,6 +15,15 @@ public final class Invoice {
                            long feeCents, long includedUnits) {
     }
 
+    /**
+     * 未结清账单因迟到补报触发的一次重算审计：记录重算时刻、触发事件、
+     * 重算前后金额与当时的完整计费依据事件集合（差异可逐个事件核对）。
+     */
+    public record RecalcAudit(long at, String triggerEventId,
+                              long oldUsageFeeCents, long newUsageFeeCents,
+                              long oldTotalCents, long newTotalCents,
+                              List<String> basisEventIds) {
+    }
 
     private String id;
     private String subscriptionId;
@@ -30,6 +39,15 @@ public final class Invoice {
     private List<LineItem> lineItems = new ArrayList<>();
     private List<Long> attemptAt = new ArrayList<>();
     private List<String> attemptResults = new ArrayList<>();
+    private InvoiceKind kind = InvoiceKind.REGULAR;
+    /** 仅 ADJUSTMENT：关联的原账单 id。 */
+    private String linkedInvoiceId;
+    /** 仅 ADJUSTMENT：本次补差覆盖的迟到补报事件 id（可逐个核对来源）。 */
+    private List<String> sourceEventIds = new ArrayList<>();
+    /** 仅 REGULAR：生成/最近一次重算时已计入账单的事件 id（补差覆盖判定的依据）。 */
+    private List<String> billedEventIds = new ArrayList<>();
+    /** 仅 REGULAR 未结清期间：迟到补报触发的重算审计轨迹。 */
+    private List<RecalcAudit> recalcAudits = new ArrayList<>();
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -56,4 +74,11 @@ public final class Invoice {
     public List<Long> getAttemptAt() { return attemptAt; }
     public List<String> getAttemptResults() { return attemptResults; }
     public List<LineItem> getLineItems() { return lineItems; }
+    public InvoiceKind getKind() { return kind; }
+    public void setKind(InvoiceKind kind) { this.kind = kind; }
+    public String getLinkedInvoiceId() { return linkedInvoiceId; }
+    public void setLinkedInvoiceId(String linkedInvoiceId) { this.linkedInvoiceId = linkedInvoiceId; }
+    public List<String> getSourceEventIds() { return sourceEventIds; }
+    public List<String> getBilledEventIds() { return billedEventIds; }
+    public List<RecalcAudit> getRecalcAudits() { return recalcAudits; }
 }

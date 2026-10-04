@@ -36,9 +36,18 @@ public class UsageService {
     public static final long OUT_OF_ORDER_TOLERANCE_MILLIS =
             java.time.Duration.ofDays(60).toMillis();
 
+    /**
+     * 迟到补报回调：事件 occurredAt 落在当前账期之前（历史账期）时触发，
+     * 由计费侧决定重算未结清账单或生成补差调整单。setter 注入避免循环依赖。
+     */
+    public interface LateUsageHandler {
+        void onLateUsage(String subscriptionId, long periodStart, UsageEvent event);
+    }
+
     private final UsageEventRepository eventRepository;
     private final SubscriptionRepository subscriptionRepository;
     private final ClockSource clock;
+    private LateUsageHandler lateUsageHandler;
 
     public UsageService(UsageEventRepository eventRepository,
                         SubscriptionRepository subscriptionRepository,
@@ -46,6 +55,10 @@ public class UsageService {
         this.eventRepository = eventRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.clock = clock;
+    }
+
+    public void setLateUsageHandler(LateUsageHandler lateUsageHandler) {
+        this.lateUsageHandler = lateUsageHandler;
     }
 
     public UsageEvent report(String eventId,
@@ -81,6 +94,18 @@ public class UsageService {
                 eventId, subscriptionId,
                 eventRepository.findBySubscriptionAndOccurredBetween(
                         subscriptionId, s.getCreatedAt(), Long.MAX_VALUE).size());
+        // 迟到补报闭环：事件所属账期在上报时刻已结束 -> 定位该账期并通知计费侧
+        // （不依赖订阅是否已续订：只要账期 [pStart, pEnd) 满足 pEnd <= now 即为迟到补报）
+        if (lateUsageHandler != null) {
+            long periodLen = SubscriptionService.nextPeriodEnd(s.getCreatedAt()) - s.getCreatedAt();
+            long periodIndex = (occurredAt - s.getCreatedAt()) / periodLen;
+            long periodStart = s.getCreatedAt() + periodIndex * periodLen;
+            if (periodStart + periodLen <= now) {
+                log.info("[usage] late report detected eventId={} occurredAt={} -> period=[{},{})",
+                        eventId, occurredAt, periodStart, periodStart + periodLen);
+                lateUsageHandler.onLateUsage(subscriptionId, periodStart, event);
+            }
+        }
         return event;
     }
 
