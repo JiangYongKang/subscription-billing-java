@@ -51,6 +51,8 @@ public final class BillingTestFixtures {
         this.subscriptionService.setUsageService(usageService);
         this.billingService = new BillingService(invoiceRepository, subscriptionRepository,
                 planRepository, usageService, pricingService, gateway, clock);
+        // 用量事件被接受后自动触发账单侧迟到补报处理（未结清重算 / 已结清补差）
+        this.usageService.setLateUsageListener(billingService::processLateUsage);
         this.dunningService = new DunningService(invoiceRepository, gateway, clock, billingService);
         this.dunningService.configure(DEFAULT_POLICY);
     }

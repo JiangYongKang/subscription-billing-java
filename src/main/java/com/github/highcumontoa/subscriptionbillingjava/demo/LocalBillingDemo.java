@@ -75,7 +75,32 @@ public final class LocalBillingDemo {
         System.out.println("真实扣款次数(预期2): " + fx.gateway.recordsOf(inv.getId()).size()
                 + " records=" + fx.gateway.recordsOf(inv.getId()));
 
-        banner("7) 另一订阅：持续失败直到重试耗尽 -> FAILED");
+        banner("7) 账期结清后迟到补报 -> 补差调整单 -> 收款 -> 对账平衡");
+        var fx3 = BillingTestFixtures.create();
+        Subscription sub3 = fx3.subscriptionService.create("BASIC", fx3.clock.nowMillis());
+        long p3 = sub3.getPeriodStart();
+        fx3.usageService.report("EVT-1", sub3.getId(), 250L, p3 + fx3.days(5));
+        fx3.clock.set(sub3.getPeriodEnd() + 1L);
+        Invoice inv3 = fx3.billingService.generateInvoice(sub3.getId(), p3);
+        fx3.billingService.confirmPayment(inv3.getId());
+        System.out.println("原账单=" + inv3.getId() + " total=" + inv3.getTotalCents()
+                + "c status=" + inv3.getStatus());
+        fx3.usageService.report("EVT-LATE-1", sub3.getId(), 50L, p3 + fx3.days(10));
+        var adjs = fx3.invoiceRepository.findAdjustments(sub3.getId(), p3);
+        Invoice adj = adjs.get(0);
+        System.out.println("补差调整单=" + adj.getId() + " linkedTo=" + adj.getLinkedInvoiceId()
+                + " deltaUnits=" + adj.getDeltaUnits() + " basisEvents=" + adj.getBasisEventIds()
+                + " total=" + adj.getTotalCents() + "c");
+        fx3.billingService.confirmPayment(adj.getId());
+        fx3.billingService.confirmPayment(adj.getId()); // 重复确认零副作用
+        System.out.println("调整单状态=" + adj.getStatus()
+                + " 扣款次数=" + fx3.gateway.recordsOf(adj.getId()).size());
+        var stmt = fx3.billingService.reconcile(sub3.getId(), p3);
+        System.out.println("对账: 原账单=" + stmt.originalTotalCents() + "c + 补差="
+                + stmt.adjustmentTotalCents() + "c = 应收=" + stmt.recomputedTotalCents()
+                + "c, 差额=" + stmt.discrepancyCents() + "c (平衡=" + stmt.balanced() + ")");
+
+        banner("8) 另一订阅：持续失败直到重试耗尽 -> FAILED");
         var fx2 = BillingTestFixtures.create();
         Subscription sub2 = fx2.subscriptionService.create("PRO", fx2.clock.nowMillis());
         fx2.clock.set(sub2.getPeriodEnd() + 1L);

@@ -15,9 +15,23 @@ public final class Invoice {
                            long feeCents, long includedUnits) {
     }
 
+    /**
+     * 未结清账单因迟到补报触发的一次金额重算审计：
+     * 记录重算时刻、重算前后金额、新增用量与引发差异的事件 ID（判定依据可核对）。
+     */
+    public record Recalculation(long at, long oldTotalCents, long newTotalCents,
+                                long deltaUnits, List<String> causeEventIds) {
+    }
 
     private String id;
     private String subscriptionId;
+    private InvoiceKind kind = InvoiceKind.REGULAR;
+    /** ADJUSTMENT 专用：关联的原账单 ID。 */
+    private String linkedInvoiceId;
+    /** 本账单（或本次补差）计价所依据的用量事件 ID 集合。 */
+    private List<String> basisEventIds = new ArrayList<>();
+    /** ADJUSTMENT 专用：本次补报新增的用量单位数。 */
+    private long deltaUnits;
     private long periodStart;
     private long periodEnd;
     private long generatedAt;
@@ -30,11 +44,20 @@ public final class Invoice {
     private List<LineItem> lineItems = new ArrayList<>();
     private List<Long> attemptAt = new ArrayList<>();
     private List<String> attemptResults = new ArrayList<>();
+    private List<Recalculation> recalculations = new ArrayList<>();
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
     public String getSubscriptionId() { return subscriptionId; }
     public void setSubscriptionId(String subscriptionId) { this.subscriptionId = subscriptionId; }
+    public InvoiceKind getKind() { return kind; }
+    public void setKind(InvoiceKind kind) { this.kind = kind; }
+    public String getLinkedInvoiceId() { return linkedInvoiceId; }
+    public void setLinkedInvoiceId(String linkedInvoiceId) { this.linkedInvoiceId = linkedInvoiceId; }
+    public List<String> getBasisEventIds() { return basisEventIds; }
+    public long getDeltaUnits() { return deltaUnits; }
+    public void setDeltaUnits(long deltaUnits) { this.deltaUnits = deltaUnits; }
+    public List<Recalculation> getRecalculations() { return recalculations; }
     public long getPeriodStart() { return periodStart; }
     public void setPeriodStart(long periodStart) { this.periodStart = periodStart; }
     public long getPeriodEnd() { return periodEnd; }

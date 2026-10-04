@@ -36,9 +36,18 @@ public class UsageService {
     public static final long OUT_OF_ORDER_TOLERANCE_MILLIS =
             java.time.Duration.ofDays(60).toMillis();
 
+    /**
+     * 用量事件被接受后的通知钩子（可选）：用于触发迟到补报的账单侧处理
+     * （未结清账期重算金额 / 已结清账期生成补差调整单）。
+     */
+    public interface LateUsageListener {
+        void onUsageAccepted(String subscriptionId, long occurredAt);
+    }
+
     private final UsageEventRepository eventRepository;
     private final SubscriptionRepository subscriptionRepository;
     private final ClockSource clock;
+    private volatile LateUsageListener lateUsageListener;
 
     public UsageService(UsageEventRepository eventRepository,
                         SubscriptionRepository subscriptionRepository,
@@ -46,6 +55,10 @@ public class UsageService {
         this.eventRepository = eventRepository;
         this.subscriptionRepository = subscriptionRepository;
         this.clock = clock;
+    }
+
+    public void setLateUsageListener(LateUsageListener lateUsageListener) {
+        this.lateUsageListener = lateUsageListener;
     }
 
     public UsageEvent report(String eventId,
@@ -81,6 +94,10 @@ public class UsageService {
                 eventId, subscriptionId,
                 eventRepository.findBySubscriptionAndOccurredBetween(
                         subscriptionId, s.getCreatedAt(), Long.MAX_VALUE).size());
+        LateUsageListener listener = this.lateUsageListener;
+        if (listener != null) {
+            listener.onUsageAccepted(subscriptionId, occurredAt);
+        }
         return event;
     }
 
