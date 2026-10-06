@@ -126,10 +126,19 @@ FAILED 再重试-> RETRY_EXHAUSTED
 
 - `kind=ADJUSTMENT`，`linkedInvoiceId` 关联原账单，`id=ADJ-<sub>-<periodStart>-<序号>`；
 - `planFeeCents=0`、`usageFeeCents=totalCents=差额`（套餐费不重收，只补用量差额）；
-- `sourceEventIds` 记录本次补差覆盖的迟到补报事件：窗口内未被原账单
-  （`billedEventIds`，生成/重算时落盘）与既有调整单覆盖的事件，来源可逐个核对；
+- `sourceEventIds` / `sourceEventUsages` 记录本次补差覆盖的迟到补报事件：窗口内未被
+  原账单（`billedEventIds`，生成/重算时落盘）与既有调整单覆盖的事件；
+  `sourceEventUsages` 逐笔给出事件 id、用量与发生时间，可逐笔核对来源；
+- `newUnitsTotal` 为本次补差新增用量总量（恒等于 `sourceEventUsages` 各笔用量之和）；
+- `adjustmentPricing` 为补差金额的计价说明：计费套餐、账期包含额度、
+  补差前后口径的总用量与超用量、新增用量，以及新增超用区间的阶梯切片
+  `tierSlices`（每段：区间、单价、单位数、金额）。新增用量先抵扣包含额度的剩余部分，
+  超出部分按计费套餐阶梯边际累进计价；切片金额之和恒等于补差金额
+  （= `overageFee(补差后超用) − overageFee(补差前已出账超用)`，可复现核对）；
 - 与普通账单**同构**：走同一个 `confirmPayment` / 催收 / 查询入口，
-  `(subscriptionId, periodStart)` 唯一索引只约束原始账单，调整单按生成序号枚举。
+  `(subscriptionId, periodStart)` 唯一索引只约束原始账单，调整单按生成序号枚举；
+- 调整单落盘后即为只读单据：金额、来源明细与计价说明不再被任何后续操作改写
+  （新的迟到补报只会产生新的调整单；收款成功或进入催收/终态后口径同样冻结）。
 
 幂等与并发：
 
@@ -137,6 +146,9 @@ FAILED 再重试-> RETRY_EXHAUSTED
   差额为 0 即 `NO_CHANGE`，绝不重复生成补差金额；
 - 处理全程在订阅级互斥锁内（与 `confirmPayment` 同一把锁），并发补报与并发确认
   各自串行化；调整单重复确认同样零副作用（复用 4.2 的 PAID 短路）；
+- 金额口径与来源/计价明细取自**同一次事件快照**：并发补报落在两次读取之间
+  不会造成单据明细与金额不自洽；快照之后新到的事件由它自己的迟到回调再触发
+  一轮补差，差额法保证多轮合计恰好等于应收差额、且各张调整单来源事件互不重叠；
 - 没有新增迟到用量时差额为 0，**不会凭空生成调整单**。
 
 对账（`BillingService.reconcile(subscriptionId, periodStart)`）：
@@ -187,7 +199,7 @@ FAILED 再重试-> RETRY_EXHAUSTED
 # 编译
 mvn -q -DskipTests compile
 
-# 运行全部单元测试（28 个用例，秒级完成）
+# 运行全部单元测试（29 个用例，秒级完成）
 mvn test
 
 # 只看某个测试类
@@ -208,7 +220,7 @@ mvn -q exec:java -Dexec.mainClass=com.github.highcumontoa.subscriptionbillingjav
 | `UsageServiceTest` | 重复事件、乱序、迟到补报、非法输入、8 线程并发同一 eventId |
 | `BillingServiceTest` | 额度内/超用/周期中升级账单、总额守恒、账期唯一、重复确认仅扣款一次 |
 | `DunningServiceTest` | 首跳失败入催收、未到期拒绝、到期重试成功后幂等、重试耗尽 FAILED |
-| `LateUsageAdjustmentTest` | 结清后补报生成补差并收款、对账差额为零、重复/并发触发不重复计费、未结清账期重算与汇总一致、无新增不生成、超窗拒绝 |
+| `LateUsageAdjustmentTest` | 结清后补报生成补差（含新增用量明细与计价说明）并收款、对账差额为零、重复/并发触发不重复计费且明细守恒、未结清账期重算与汇总一致、抵扣剩余额度与跨阶梯边际计价、收款后口径冻结、无新增不生成、超窗拒绝 |
 
 > 说明：核心域服务是无 Spring 依赖的普通 Java 类，测试用 `ManualClock`
 > 固定/推进时间，保证所有结论确定、可复现。

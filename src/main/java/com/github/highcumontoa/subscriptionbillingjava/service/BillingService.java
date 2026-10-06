@@ -123,7 +123,11 @@ public class BillingService {
                 lineItems.add(new Invoice.LineItem(plan.code(), lo, hi, segFee, segUnits));
             }
 
-            long usedUnits = usageService.aggregate(subscriptionId, periodStart, periodEnd);
+            // 单次快照：账单金额口径与 billedEventIds 来自同一读，
+            // 快照后新到的迟到事件由其回调走重算/补差流程收敛
+            List<UsageEvent> basis = usageService.aggregatedEvents(
+                    subscriptionId, periodStart, periodEnd);
+            long usedUnits = basis.stream().mapToLong(UsageEvent::quantity).sum();
             long overageUnits = Math.max(0L, usedUnits - includedUnits);
             String billingPlanCode = s.getSegments().get(s.getSegments().size() - 1).planCode();
             Plan billingPlan = planRepository.requireByCode(billingPlanCode);
@@ -143,8 +147,6 @@ public class BillingService {
             invoice.setAttempt(0);
             invoice.setNextRetryAt(0L);
             invoice.getLineItems().addAll(lineItems);
-            List<UsageEvent> basis = usageService.aggregatedEvents(
-                    subscriptionId, periodStart, periodEnd);
             basis.forEach(e -> invoice.getBilledEventIds().add(e.eventId()));
             invoiceRepository.save(invoice);
             log.info("[billing] generate decision=CREATED id={} sub={} period=[{},{}) "
@@ -275,8 +277,10 @@ public class BillingService {
     private LateUsageOutcome recalculateOpenInvoice(Invoice inv, UsageEvent trigger) {
         long includedUnits = inv.getLineItems().stream()
                 .mapToLong(Invoice.LineItem::includedUnits).sum();
-        long usedUnits = usageService.aggregate(
+        // 单次快照：金额口径与依据事件集合来自同一读，保证审计记录自洽
+        List<UsageEvent> snapshot = usageService.aggregatedEvents(
                 inv.getSubscriptionId(), inv.getPeriodStart(), inv.getPeriodEnd());
+        long usedUnits = snapshot.stream().mapToLong(UsageEvent::quantity).sum();
         long overageUnits = Math.max(0L, usedUnits - includedUnits);
         Plan billingPlan = planRepository.requireByCode(billingPlanCode(inv));
         long newUsageFee = pricingService.overageFee(billingPlan.overageTiers(), overageUnits);
@@ -287,9 +291,7 @@ public class BillingService {
             return new LateUsageOutcome(LateUsageOutcome.Kind.NO_CHANGE, inv, 0L,
                     "重算金额与原金额一致");
         }
-        List<String> basisEventIds = usageService.aggregatedEvents(
-                        inv.getSubscriptionId(), inv.getPeriodStart(), inv.getPeriodEnd())
-                .stream().map(UsageEvent::eventId).toList();
+        List<String> basisEventIds = snapshot.stream().map(UsageEvent::eventId).toList();
         long oldUsageFee = inv.getUsageFeeCents();
         long oldTotal = inv.getTotalCents();
         inv.setUsageFeeCents(newUsageFee);
@@ -315,7 +317,12 @@ public class BillingService {
         long periodStart = original.getPeriodStart();
         long includedUnits = original.getLineItems().stream()
                 .mapToLong(Invoice.LineItem::includedUnits).sum();
-        long usedUnits = usageService.aggregate(subId, periodStart, original.getPeriodEnd());
+        // 单次快照：事件列表与总量来自同一读，避免并发补报落在两次读之间
+        // 造成“金额口径”与“来源明细”不自洽（快照后新到的事件由它自己的
+        // 迟到回调再触发一轮补差，差额法自动收敛）。
+        List<UsageEvent> snapshot = usageService.aggregatedEvents(
+                subId, periodStart, original.getPeriodEnd());
+        long usedUnits = snapshot.stream().mapToLong(UsageEvent::quantity).sum();
         long overageUnits = Math.max(0L, usedUnits - includedUnits);
         Plan billingPlan = planRepository.requireByCode(billingPlanCode(original));
         long expectedUsageFee = pricingService.overageFee(billingPlan.overageTiers(), overageUnits);
@@ -333,14 +340,26 @@ public class BillingService {
                     "无新增应收差额，不生成补差调整单");
         }
 
-        // 补差来源：窗口内未被原账单（生成/重算时已计费事件）与既有调整单覆盖的事件
+        // 补差来源：快照内未被原账单（生成/重算时已计费事件）与既有调整单覆盖的事件
         Set<String> covered = new HashSet<>(original.getBilledEventIds());
         adjustments.forEach(a -> covered.addAll(a.getSourceEventIds()));
-        List<String> sourceEventIds = usageService.aggregatedEvents(
-                        subId, periodStart, original.getPeriodEnd())
-                .stream().map(UsageEvent::eventId)
-                .filter(id -> !covered.contains(id))
+        List<UsageEvent> sourceEvents = snapshot.stream()
+                .filter(e -> !covered.contains(e.eventId()))
                 .toList();
+        List<String> sourceEventIds = sourceEvents.stream().map(UsageEvent::eventId).toList();
+
+        // 计价说明：新增用量先抵扣包含额度剩余部分，超出部分按计费套餐阶梯边际计价。
+        // 已出账口径用量 = 当前口径用量 − 本次新增用量（覆盖集合互斥且并集为全部事件）。
+        long newUnits = sourceEvents.stream().mapToLong(UsageEvent::quantity).sum();
+        long usedUnitsBefore = usedUnits - newUnits;
+        long overageBefore = Math.max(0L, usedUnitsBefore - includedUnits);
+        List<PricingService.TierSlice> tierSlices = pricingService.overageTierSlices(
+                billingPlan.overageTiers(), overageBefore, overageUnits);
+        long sliceTotal = tierSlices.stream()
+                .mapToLong(PricingService.TierSlice::feeCents).sum();
+        Invoice.AdjustmentPricing pricing = new Invoice.AdjustmentPricing(
+                billingPlan.code(), includedUnits, usedUnitsBefore, usedUnits,
+                newUnits, overageBefore, overageUnits, tierSlices, delta);
 
         Invoice adj = new Invoice();
         adj.setId("ADJ-" + subId + "-" + periodStart + "-" + (adjustments.size() + 1));
@@ -357,11 +376,19 @@ public class BillingService {
         adj.setAttempt(0);
         adj.setNextRetryAt(0L);
         adj.getSourceEventIds().addAll(sourceEventIds);
+        sourceEvents.forEach(e -> adj.getSourceEventUsages().add(
+                new Invoice.SourceEventUsage(e.eventId(), e.quantity(), e.occurredAt())));
+        adj.setNewUnitsTotal(newUnits);
+        adj.setAdjustmentPricing(pricing);
         invoiceRepository.save(adj);
         log.info("[billing] lateUsage adjust decision=ADJUSTMENT_CREATED id={} linkedTo={} "
-                        + "trigger={} delta={}c (expected={}c billed={}c) sourceEvents={}",
+                        + "trigger={} delta={}c (expected={}c billed={}c) sourceEvents={} "
+                        + "newUnits={} usedUnits {}->{} overage {}->{} tierSlices={} "
+                        + "sliceTotal={}c conserved(sliceTotal=delta)={}",
                 adj.getId(), original.getId(), trigger.eventId(), delta,
-                expectedTotal, billedTotal, sourceEventIds);
+                expectedTotal, billedTotal, sourceEventIds,
+                newUnits, usedUnitsBefore, usedUnits, overageBefore, overageUnits,
+                tierSlices, sliceTotal, sliceTotal == delta);
         return new LateUsageOutcome(LateUsageOutcome.Kind.ADJUSTMENT_CREATED, adj, delta,
                 "账期已结清，生成补差调整单");
     }

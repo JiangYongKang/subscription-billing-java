@@ -1,5 +1,7 @@
 package com.github.highcumontoa.subscriptionbillingjava.billing;
 
+import com.github.highcumontoa.subscriptionbillingjava.service.PricingService;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -25,6 +27,42 @@ public final class Invoice {
                               List<String> basisEventIds) {
     }
 
+    /**
+     * 仅 ADJUSTMENT：本次补差覆盖的一笔迟到补报记录
+     * （事件 id、用量、实际发生时间），业务可逐笔核对来源。
+     */
+    public record SourceEventUsage(String eventId, long quantity, long occurredAt) {
+    }
+
+    /**
+     * 仅 ADJUSTMENT：补差金额的计价说明（按什么规则把新增用量算成了多少钱）。
+     *
+     * <p>口径：新增用量先抵扣账期包含额度的剩余部分，超出部分按计费套餐的
+     * 阶梯单价边际累进计价；{@code tierSlices} 逐段给出新增超用落在各档的
+     * 单位数与金额，切片金额之和恒等于 {@code deltaCents}（= 本单补差金额）。
+     *
+     * @param planCode         计费套餐（账期末开口段套餐，与原账单口径一致）
+     * @param includedUnits    账期包含额度（原账单冻结值）
+     * @param usedUnitsBefore  补差前已出账口径的总用量
+     * @param usedUnitsAfter   补差后口径的总用量
+     * @param newUnits         本次新增用量（= usedUnitsAfter − usedUnitsBefore，
+     *                         也等于 sourceEventUsages 各笔 quantity 之和）
+     * @param overageBefore    补差前已出账口径的超用量
+     * @param overageAfter     补差后口径的超用量
+     * @param tierSlices       新增超用区间 (overageBefore, overageAfter] 的阶梯切片
+     * @param deltaCents       补差金额（= Σ tierSlices.feeCents）
+     */
+    public record AdjustmentPricing(String planCode,
+                                    long includedUnits,
+                                    long usedUnitsBefore,
+                                    long usedUnitsAfter,
+                                    long newUnits,
+                                    long overageBefore,
+                                    long overageAfter,
+                                    List<PricingService.TierSlice> tierSlices,
+                                    long deltaCents) {
+    }
+
     private String id;
     private String subscriptionId;
     private long periodStart;
@@ -44,6 +82,12 @@ public final class Invoice {
     private String linkedInvoiceId;
     /** 仅 ADJUSTMENT：本次补差覆盖的迟到补报事件 id（可逐个核对来源）。 */
     private List<String> sourceEventIds = new ArrayList<>();
+    /** 仅 ADJUSTMENT：本次补差覆盖的迟到补报逐笔明细（事件、用量、发生时间）。 */
+    private List<SourceEventUsage> sourceEventUsages = new ArrayList<>();
+    /** 仅 ADJUSTMENT：本次补差新增用量总量（= sourceEventUsages 各笔之和）。 */
+    private long newUnitsTotal;
+    /** 仅 ADJUSTMENT：补差金额的计价说明（新增用量按什么规则算成了多少钱）。 */
+    private AdjustmentPricing adjustmentPricing;
     /** 仅 REGULAR：生成/最近一次重算时已计入账单的事件 id（补差覆盖判定的依据）。 */
     private List<String> billedEventIds = new ArrayList<>();
     /** 仅 REGULAR 未结清期间：迟到补报触发的重算审计轨迹。 */
@@ -79,6 +123,13 @@ public final class Invoice {
     public String getLinkedInvoiceId() { return linkedInvoiceId; }
     public void setLinkedInvoiceId(String linkedInvoiceId) { this.linkedInvoiceId = linkedInvoiceId; }
     public List<String> getSourceEventIds() { return sourceEventIds; }
+    public List<SourceEventUsage> getSourceEventUsages() { return sourceEventUsages; }
+    public long getNewUnitsTotal() { return newUnitsTotal; }
+    public void setNewUnitsTotal(long newUnitsTotal) { this.newUnitsTotal = newUnitsTotal; }
+    public AdjustmentPricing getAdjustmentPricing() { return adjustmentPricing; }
+    public void setAdjustmentPricing(AdjustmentPricing adjustmentPricing) {
+        this.adjustmentPricing = adjustmentPricing;
+    }
     public List<String> getBilledEventIds() { return billedEventIds; }
     public List<RecalcAudit> getRecalcAudits() { return recalcAudits; }
 }

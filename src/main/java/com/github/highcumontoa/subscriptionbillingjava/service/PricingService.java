@@ -95,4 +95,53 @@ public class PricingService {
         log.info("[pricing] overageFee overageUnits={} totalFee={}c", overageUnits, fee);
         return fee;
     }
+
+    /**
+     * 超用量在某档内的一段计价明细：区间 ({@code fromOverageUnitExclusive},
+     * {@code toOverageUnitInclusive}] 共 {@code units} 个单位，按
+     * {@code unitPriceCents} 计价得 {@code feeCents}（units × 单价，守恒可核对）。
+     */
+    public record TierSlice(long fromOverageUnitExclusive,
+                            long toOverageUnitInclusive,
+                            long unitPriceCents,
+                            long units,
+                            long feeCents) {
+    }
+
+    /**
+     * 边际阶梯计价明细：把超用区间 ({@code fromOverageExclusive},
+     * {@code toOverageInclusive}] 按阶梯切成若干段，逐段给出单位数与金额。
+     *
+     * <p>用于补差调整单的计价说明：已出账口径超用 from、补差后口径超用 to，
+     * 新增超用 (to − from) 个单位落在哪些档、各档多少钱，切片金额之和恒等于
+     * {@code overageFee(tiers, to) − overageFee(tiers, from)}（可复现核对）。
+     */
+    public List<TierSlice> overageTierSlices(List<OverageTier> tiers,
+                                             long fromOverageExclusive,
+                                             long toOverageInclusive) {
+        List<TierSlice> slices = new java.util.ArrayList<>();
+        if (tiers == null || tiers.isEmpty() || toOverageInclusive <= fromOverageExclusive) {
+            log.info("[pricing] tierSlices empty range=({},{}]", fromOverageExclusive,
+                    toOverageInclusive);
+            return slices;
+        }
+        for (OverageTier tier : tiers) {
+            long tierUpper = tier.toOverageUnitInclusive() == null
+                    ? toOverageInclusive
+                    : Math.min(tier.toOverageUnitInclusive(), toOverageInclusive);
+            long lo = Math.max(tier.fromOverageUnitInclusive(), fromOverageExclusive);
+            long covered = tierUpper - lo;
+            if (covered > 0) {
+                slices.add(new TierSlice(lo, tierUpper, tier.unitPriceCents(),
+                        covered, covered * tier.unitPriceCents()));
+                log.info("[pricing] tierSlice ({},{}] x {}c units={} subtotal={}c",
+                        lo, tierUpper, tier.unitPriceCents(), covered,
+                        covered * tier.unitPriceCents());
+            }
+        }
+        long total = slices.stream().mapToLong(TierSlice::feeCents).sum();
+        log.info("[pricing] tierSlices range=({},{}] slices={} marginalFee={}c",
+                fromOverageExclusive, toOverageInclusive, slices.size(), total);
+        return slices;
+    }
 }
