@@ -5,6 +5,7 @@ import com.github.highcumontoa.subscriptionbillingjava.billing.InvoiceKind;
 import com.github.highcumontoa.subscriptionbillingjava.billing.InvoiceStatus;
 import com.github.highcumontoa.subscriptionbillingjava.billing.LocalPaymentGateway;
 import com.github.highcumontoa.subscriptionbillingjava.billing.RetryPolicy;
+import com.github.highcumontoa.subscriptionbillingjava.domain.OverageTier;
 import com.github.highcumontoa.subscriptionbillingjava.domain.Plan;
 import com.github.highcumontoa.subscriptionbillingjava.domain.PlanSegment;
 import com.github.highcumontoa.subscriptionbillingjava.domain.Subscription;
@@ -336,11 +337,15 @@ public class BillingService {
         // 补差来源：窗口内未被原账单（生成/重算时已计费事件）与既有调整单覆盖的事件
         Set<String> covered = new HashSet<>(original.getBilledEventIds());
         adjustments.forEach(a -> covered.addAll(a.getSourceEventIds()));
-        List<String> sourceEventIds = usageService.aggregatedEvents(
+        List<UsageEvent> sourceEvents = usageService.aggregatedEvents(
                         subId, periodStart, original.getPeriodEnd())
-                .stream().map(UsageEvent::eventId)
-                .filter(id -> !covered.contains(id))
+                .stream().filter(e -> !covered.contains(e.eventId()))
                 .toList();
+        List<String> sourceEventIds = sourceEvents.stream().map(UsageEvent::eventId).toList();
+
+        // 补差核对明细：新增用量、计价规则切片、逐笔来源费用
+        Invoice.AdjustmentDetail detail = buildAdjustmentDetail(
+                original, includedUnits, usedUnits, billingPlan, sourceEvents);
 
         Invoice adj = new Invoice();
         adj.setId("ADJ-" + subId + "-" + periodStart + "-" + (adjustments.size() + 1));
@@ -357,13 +362,70 @@ public class BillingService {
         adj.setAttempt(0);
         adj.setNextRetryAt(0L);
         adj.getSourceEventIds().addAll(sourceEventIds);
+        adj.setAdjustmentDetail(detail);
         invoiceRepository.save(adj);
         log.info("[billing] lateUsage adjust decision=ADJUSTMENT_CREATED id={} linkedTo={} "
-                        + "trigger={} delta={}c (expected={}c billed={}c) sourceEvents={}",
+                        + "trigger={} delta={}c (expected={}c billed={}c) addedUnits={} "
+                        + "overage {}->{} plan={} slices={} sourceEvents={}",
                 adj.getId(), original.getId(), trigger.eventId(), delta,
-                expectedTotal, billedTotal, sourceEventIds);
+                expectedTotal, billedTotal, detail.addedUnits(),
+                detail.overageBeforeUnits(), detail.overageAfterUnits(), detail.planCode(),
+                detail.pricingSlices(), sourceEventIds);
         return new LateUsageOutcome(LateUsageOutcome.Kind.ADJUSTMENT_CREATED, adj, delta,
                 "账期已结清，生成补差调整单");
+    }
+
+    /**
+     * 组装补差调整单的核对明细（纯计算，不落盘）：
+     * <ul>
+     *   <li>addedUnits = 本次来源补报事件的用量之和；</li>
+     *   <li>补报前超用量 = max(0, 当前总用量 − 新增用量 − 包含额度)，
+     *       补报后超用量 = max(0, 当前总用量 − 包含额度)；</li>
+     *   <li>pricingSlices：新增超用量区间 (before, after] 按计费套餐阶梯展开，
+     *       各切片费用之和 = 本次补差金额；</li>
+     *   <li>lines：来源事件按 (occurredAt, eventId) 排序后逐笔边际计价：
+     *       从“已计费用量”（当前总用量 − 新增用量）起累计，第 i 笔费用
+     *       = 阶梯费(max(0, 累计+qty−额度)) − 阶梯费(max(0, 累计−额度))，
+     *       逐笔 telescoping 求和恒等于本次补差金额（新增用量中被既有
+     *       包含额度吸收的部分不计费），可逐笔核对。</li>
+     * </ul>
+     */
+    private Invoice.AdjustmentDetail buildAdjustmentDetail(
+            Invoice original, long includedUnits, long usedUnits,
+            Plan billingPlan, List<UsageEvent> sourceEvents) {
+        long addedUnits = sourceEvents.stream().mapToLong(UsageEvent::quantity).sum();
+        long overageBefore = Math.max(0L, usedUnits - addedUnits - includedUnits);
+        long overageAfter = Math.max(0L, usedUnits - includedUnits);
+        var tiers = billingPlan.overageTiers();
+
+        List<Invoice.PricingSlice> slices = new java.util.ArrayList<>();
+        for (OverageTier tier : tiers) {
+            long tierTo = tier.toOverageUnitInclusive() == null
+                    ? overageAfter : tier.toOverageUnitInclusive();
+            long lo = Math.max(tier.fromOverageUnitInclusive(), overageBefore);
+            long hi = Math.min(tierTo, overageAfter);
+            long units = hi - lo;
+            if (units > 0) {
+                slices.add(new Invoice.PricingSlice(lo, hi, units,
+                        tier.unitPriceCents(), units * tier.unitPriceCents()));
+            }
+        }
+
+        List<Invoice.AdjustmentLine> lines = new java.util.ArrayList<>();
+        long billedUnits = usedUnits - addedUnits;
+        long cumulative = billedUnits;
+        for (UsageEvent e : sourceEvents) {
+            long fee = pricingService.overageFee(tiers,
+                            Math.max(0L, cumulative + e.quantity() - includedUnits))
+                    - pricingService.overageFee(tiers,
+                            Math.max(0L, cumulative - includedUnits));
+            cumulative += e.quantity();
+            lines.add(new Invoice.AdjustmentLine(
+                    e.eventId(), e.occurredAt(), e.quantity(), fee));
+        }
+        return new Invoice.AdjustmentDetail(billingPlan.code(), addedUnits,
+                overageBefore, overageAfter,
+                List.copyOf(slices), List.copyOf(lines));
     }
 
     /** 账期计费口径：覆盖账期内最后时刻的套餐分段（与出账时的开口段一致）。 */

@@ -39,6 +39,35 @@ class LateUsageAdjustmentTest {
         return inv;
     }
 
+    /**
+     * 补差明细守恒不变量：Σ逐笔用量 = 新增总用量；
+     * Σ逐笔费用 = Σ计价切片费用 = 调整单总额；来源事件与逐笔明细一一对应。
+     */
+    private void assertAdjustmentDetailConsistent(Invoice adj) {
+        var detail = adj.getAdjustmentDetail();
+        long lineUnits = detail.lines().stream()
+                .mapToLong(Invoice.AdjustmentLine::quantity).sum();
+        long lineFees = detail.lines().stream()
+                .mapToLong(Invoice.AdjustmentLine::feeCents).sum();
+        long sliceUnits = detail.pricingSlices().stream()
+                .mapToLong(Invoice.PricingSlice::units).sum();
+        long sliceFees = detail.pricingSlices().stream()
+                .mapToLong(Invoice.PricingSlice::feeCents).sum();
+        System.out.println("[case] detail invariant id=" + adj.getId()
+                + " lineUnits=" + lineUnits + "/" + detail.addedUnits()
+                + " sliceUnits=" + sliceUnits
+                + " lineFees=" + lineFees + "c sliceFees=" + sliceFees
+                + "c total=" + adj.getTotalCents() + "c");
+        assertEquals(detail.addedUnits(), lineUnits, "逐笔用量之和必须等于新增总用量");
+        assertEquals(detail.overageAfterUnits() - detail.overageBeforeUnits(),
+                sliceUnits, "计价切片覆盖单位数必须等于新增超用量");
+        assertEquals(adj.getTotalCents(), lineFees, "逐笔费用之和必须等于补差总额");
+        assertEquals(adj.getTotalCents(), sliceFees, "计价切片费用之和必须等于补差总额");
+        assertEquals(adj.getSourceEventIds(),
+                detail.lines().stream().map(Invoice.AdjustmentLine::eventId).toList(),
+                "逐笔明细必须与来源补报记录一一对应");
+    }
+
     @Test
     @DisplayName("结清后补报: 生成补差调整单、来源可核对、可收款、对账差额为零")
     void lateReportAfterPaid_createsAdjustment_payableAndReconciled() {
@@ -71,6 +100,27 @@ class LateUsageAdjustmentTest {
         assertEquals(300L, adj.getTotalCents());
         assertEquals(InvoiceStatus.PENDING, adj.getStatus());
 
+        // 核对明细：新增用量、计价规则切片、逐笔来源费用都可直接读出
+        var detail = adj.getAdjustmentDetail();
+        System.out.println("[case] adjustment detail plan=" + detail.planCode()
+                + " addedUnits=" + detail.addedUnits()
+                + " overage " + detail.overageBeforeUnits() + "->" + detail.overageAfterUnits()
+                + " slices=" + detail.pricingSlices() + " lines=" + detail.lines());
+        assertEquals("BASIC", detail.planCode(), "计价规则必须标明所用套餐");
+        assertEquals(100L, detail.addedUnits(), "本次补报新增用量总数");
+        assertEquals(150L, detail.overageBeforeUnits(), "补报前超用量(250-100)");
+        assertEquals(250L, detail.overageAfterUnits(), "补报后超用量(350-100)");
+        // 新增超用量 150->250 全部落在 BASIC 第二档(3分/个): 100*3=300
+        assertEquals(List.of(new Invoice.PricingSlice(150L, 250L, 100L, 3L, 300L)),
+                detail.pricingSlices(), "计价切片必须解释新增超用量按什么单价计费");
+        assertEquals(1, detail.lines().size());
+        var line = detail.lines().get(0);
+        assertEquals("EVT-LATE-1", line.eventId());
+        assertEquals(100L, line.quantity());
+        assertEquals(p0 + fx.days(10), line.occurredAt());
+        assertEquals(300L, line.feeCents(), "逐笔费用: 超用150->250 边际计价 100*3");
+        assertAdjustmentDetailConsistent(adj);
+
         // 调整单像普通账单一样收款；重复确认零副作用
         fx.billingService.confirmPayment(adj.getId());
         fx.billingService.confirmPayment(adj.getId());
@@ -92,6 +142,70 @@ class LateUsageAdjustmentTest {
         assertEquals(1950L, rec1.expectedTotalCents());
         assertEquals(0L, rec1.discrepancyCents(), "原账单+补差 必须等于当前口径应收");
         assertEquals(rec1.expectedTotalCents(), rec2.expectedTotalCents(), "对账可复现");
+    }
+
+    @Test
+    @DisplayName("补差明细: 多笔补报合并一单、跨阶梯计价切片与逐笔费用可核对")
+    void adjustmentDetail_multiEvent_tierCrossing_reconcilable() {
+        var fx = fx();
+        var sub = fx.subscriptionService.create("BASIC", fx.clock.nowMillis());
+        long p0 = sub.getPeriodStart();
+        // 账期内只用 50 单位（额度内），账单 1000 并结清
+        fx.usageService.report("EVT-1", sub.getId(), 50L, p0 + fx.days(5));
+        fx.clock.set(sub.getPeriodEnd() + 1L);
+        Invoice inv = fx.billingService.generateInvoice(sub.getId(), p0);
+        fx.billingService.confirmPayment(inv.getId());
+        System.out.println("[case] setup PAID invoice total=" + inv.getTotalCents()
+                + "c (usage 50 <= included 100)");
+        assertEquals(1000L, inv.getTotalCents());
+
+        // 两笔迟到补报先只入汇总（暂时摘掉自动回调），再显式触发一次处理，
+        // 使一张调整单覆盖多笔来源记录
+        fx.usageService.setLateUsageHandler(null);
+        fx.usageService.report("EVT-X1", sub.getId(), 100L, p0 + fx.days(3));
+        fx.usageService.report("EVT-X2", sub.getId(), 100L, p0 + fx.days(7));
+        fx.usageService.setLateUsageHandler(fx.billingService::processLateUsage);
+        var outcome = fx.billingService.processLateUsage(sub.getId(), p0,
+                fx.eventRepository.findByEventId("EVT-X2"));
+        System.out.println("[case] explicit trigger decision=" + outcome.kind()
+                + " delta=" + outcome.deltaCents() + "c");
+        assertEquals(BillingService.LateUsageOutcome.Kind.ADJUSTMENT_CREATED, outcome.kind());
+
+        List<Invoice> adjs = fx.invoiceRepository.findAdjustments(sub.getId(), p0);
+        assertEquals(1, adjs.size(), "两笔未覆盖补报应合并为一张补差调整单");
+        Invoice adj = adjs.get(0);
+        var detail = adj.getAdjustmentDetail();
+        System.out.println("[case] detail plan=" + detail.planCode()
+                + " addedUnits=" + detail.addedUnits()
+                + " overage " + detail.overageBeforeUnits() + "->" + detail.overageAfterUnits()
+                + " slices=" + detail.pricingSlices() + " lines=" + detail.lines());
+        // 用量 50+200=250，超用 0->150；新增 200 中 50 被剩余额度吸收，150 计费
+        assertEquals(200L, detail.addedUnits());
+        assertEquals(0L, detail.overageBeforeUnits());
+        assertEquals(150L, detail.overageAfterUnits());
+        // 跨阶梯切片: (0,100]@5=500 + (100,150]@3=150 = 650
+        assertEquals(List.of(
+                        new Invoice.PricingSlice(0L, 100L, 100L, 5L, 500L),
+                        new Invoice.PricingSlice(100L, 150L, 50L, 3L, 150L)),
+                detail.pricingSlices(), "新增超用量必须按阶梯逐段展开计价规则");
+        // 逐笔边际计价（按 occurredAt 排序）:
+        // X1: 累计用量 50->150, 超用 0->50 -> 50*5=250（其中 50 被额度吸收不计费）
+        // X2: 累计用量 150->250, 超用 50->150 -> 650-250=400
+        assertEquals(2, detail.lines().size());
+        assertEquals(new Invoice.AdjustmentLine("EVT-X1", p0 + fx.days(3), 100L, 250L),
+                detail.lines().get(0));
+        assertEquals(new Invoice.AdjustmentLine("EVT-X2", p0 + fx.days(7), 100L, 400L),
+                detail.lines().get(1));
+        assertEquals(650L, adj.getTotalCents());
+        assertAdjustmentDetailConsistent(adj);
+
+        // 对账差额为零；调整单可正常收款
+        fx.billingService.confirmPayment(adj.getId());
+        assertEquals(InvoiceStatus.PAID, adj.getStatus());
+        var rec = fx.billingService.reconcile(sub.getId(), p0);
+        System.out.println("[case] reconcile expected=" + rec.expectedTotalCents()
+                + "c discrepancy=" + rec.discrepancyCents() + "c");
+        assertEquals(0L, rec.discrepancyCents());
     }
 
     @Test
@@ -155,6 +269,8 @@ class LateUsageAdjustmentTest {
         // 每张调整单的来源事件不重叠，且并集恰好是全部迟到补报
         long srcCount = adjs.stream().flatMap(a -> a.getSourceEventIds().stream()).distinct().count();
         assertEquals(3L, srcCount, "补差来源事件为 EVT-LATE-1/C0/C1 且不重复");
+        // 每张调整单的明细都满足守恒不变量（逐笔费用=切片费用=单据总额）
+        adjs.forEach(this::assertAdjustmentDetailConsistent);
 
         // 并发收款确认：每张调整单只扣款一次
         ExecutorService payPool = Executors.newFixedThreadPool(threads);
@@ -228,6 +344,56 @@ class LateUsageAdjustmentTest {
         fx.billingService.confirmPayment(inv.getId());
         assertEquals(1950L, fx.gateway.recordsOf(inv.getId()).get(0).amountCents);
         assertEquals(0L, fx.billingService.reconcile(sub.getId(), p0).discrepancyCents());
+    }
+
+    @Test
+    @DisplayName("边界: 调整单进入催收后，新补报只产生新单，已计入金额与明细不被改写")
+    void adjustmentInDunning_notRewrittenByLaterReports() {
+        var fx = fx();
+        var sub = fx.subscriptionService.create("BASIC", fx.clock.nowMillis());
+        long p0 = sub.getPeriodStart();
+        fx.usageService.report("EVT-1", sub.getId(), 250L, p0 + fx.days(5));
+        fx.clock.set(sub.getPeriodEnd() + 1L);
+        Invoice inv = paidBasicInvoice(fx, sub.getId(), p0);
+
+        // 第一笔补报 -> ADJ-1 = 300；编排首次扣款失败使其进入催收
+        fx.usageService.report("EVT-LATE-1", sub.getId(), 100L, p0 + fx.days(10));
+        Invoice adj1 = fx.invoiceRepository.findAdjustments(sub.getId(), p0).get(0);
+        assertEquals(300L, adj1.getTotalCents());
+        var detailSnapshot = adj1.getAdjustmentDetail();
+        fx.gateway.prime(adj1.getId(), false, "CARD_DECLINED");
+        fx.gateway.prime(adj1.getId(), true, "OK_RETRY");
+        fx.billingService.confirmPayment(adj1.getId());
+        System.out.println("[case] adjustment in dunning id=" + adj1.getId()
+                + " status=" + adj1.getStatus() + " total=" + adj1.getTotalCents() + "c");
+        assertEquals(InvoiceStatus.DUNNING, adj1.getStatus());
+
+        // 催收期间又有新补报：只生成第二张调整单，ADJ-1 金额与明细不被改写
+        fx.usageService.report("EVT-LATE-2", sub.getId(), 50L, p0 + fx.days(12));
+        List<Invoice> adjs = fx.invoiceRepository.findAdjustments(sub.getId(), p0);
+        System.out.println("[case] adjustments=" + adjs.stream()
+                .map(a -> a.getId() + ":" + a.getStatus() + ":" + a.getTotalCents() + "c")
+                .toList());
+        assertEquals(2, adjs.size());
+        // 用量 400 超 300 -> 100*5+200*3=1100，应收 2100；已出账 1650+300 -> 补差 150
+        assertEquals(150L, adjs.get(1).getTotalCents());
+        assertEquals(300L, adj1.getTotalCents(), "催收中的调整单金额不得被改写");
+        assertEquals(InvoiceStatus.DUNNING, adj1.getStatus());
+        assertEquals(detailSnapshot, adj1.getAdjustmentDetail(), "已计入明细不得被改写");
+        assertAdjustmentDetailConsistent(adjs.get(1));
+
+        // 到期重试成功 -> PAID；此后重复确认零副作用；对账差额为零
+        fx.clock.set(adj1.getNextRetryAt() + 1L);
+        fx.dunningService.processRetry(adj1.getId());
+        fx.billingService.confirmPayment(adj1.getId());
+        assertEquals(InvoiceStatus.PAID, adj1.getStatus());
+        assertEquals(2, fx.gateway.recordsOf(adj1.getId()).size(),
+                "ADJ-1 共两次扣款尝试（首次失败+重试成功），无额外扣款");
+        var rec = fx.billingService.reconcile(sub.getId(), p0);
+        System.out.println("[case] reconcile expected=" + rec.expectedTotalCents()
+                + "c discrepancy=" + rec.discrepancyCents() + "c");
+        assertEquals(2100L, rec.expectedTotalCents());
+        assertEquals(0L, rec.discrepancyCents());
     }
 
     @Test

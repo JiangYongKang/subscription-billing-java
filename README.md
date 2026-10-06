@@ -17,7 +17,7 @@
 | `PlanSegment` | 账期内套餐分段 `[start, end)`；`end=null` 为开口段。分段不重叠、无缝隙 |
 | `PlanChange` | 只增不改的变更审计：CREATE / UPGRADE / DOWNGRADE / RENEW / CANCEL |
 | `UsageEvent` | 用量事件，`eventId` 全局幂等键，含发生时间 `occurredAt` 与上报时间 `reportedAt` |
-| `Invoice` | 账单：套餐费 + 用量费 + 总额；状态 PENDING / PAID / DUNNING / FAILED。`kind=REGULAR` 为原始账单（结清后金额冻结），`kind=ADJUSTMENT` 为结清后迟到补报形成的补差调整单 |
+| `Invoice` | 账单：套餐费 + 用量费 + 总额；状态 PENDING / PAID / DUNNING / FAILED。`kind=REGULAR` 为原始账单（结清后金额冻结），`kind=ADJUSTMENT` 为结清后迟到补报形成的补差调整单（携 `adjustmentDetail` 核对明细：新增用量、计价切片、逐笔来源费用） |
 | `RetryPolicy` | 收款重试策略：首次扣款 + 若干重试间隔（默认 1 天 / 3 天 / 7 天，共 4 次尝试） |
 
 金额单位统一为**分（long）**，时间单位为**毫秒时间戳**。账期固定为 **30 天**，
@@ -128,6 +128,19 @@ FAILED 再重试-> RETRY_EXHAUSTED
 - `planFeeCents=0`、`usageFeeCents=totalCents=差额`（套餐费不重收，只补用量差额）；
 - `sourceEventIds` 记录本次补差覆盖的迟到补报事件：窗口内未被原账单
   （`billedEventIds`，生成/重算时落盘）与既有调整单覆盖的事件，来源可逐个核对；
+- `adjustmentDetail` 核对明细（业务对账直接可读）：
+  - `addedUnits`：本次补报新增的总用量；
+  - `overageBeforeUnits / overageAfterUnits`：补报前/后的账期超用量
+    （相对原账单冻结的包含额度）；
+  - `pricingSlices`：新增超用量区间按账期计费套餐阶梯展开的计价切片
+    （区间、单位数、单价、小计），说明“按什么规则算成了多少钱”；
+  - `lines`：逐笔来源补报记录（事件 id、发生时间、用量、费用贡献），
+    按 `(occurredAt, eventId)` 排序后逐笔边际计价——从“已计费用量”起累计，
+    第 i 笔费用 = 阶梯费(累计+qty 对应超用) − 阶梯费(累计对应超用)，
+    新增用量中被既有包含额度吸收的部分不计费；
+  - 守恒不变量：`Σ lines.quantity = addedUnits`、
+    `Σ lines.feeCents = Σ pricingSlices.feeCents = totalCents`，
+    `lines` 与 `sourceEventIds` 一一对应；
 - 与普通账单**同构**：走同一个 `confirmPayment` / 催收 / 查询入口，
   `(subscriptionId, periodStart)` 唯一索引只约束原始账单，调整单按生成序号枚举。
 
@@ -137,7 +150,9 @@ FAILED 再重试-> RETRY_EXHAUSTED
   差额为 0 即 `NO_CHANGE`，绝不重复生成补差金额；
 - 处理全程在订阅级互斥锁内（与 `confirmPayment` 同一把锁），并发补报与并发确认
   各自串行化；调整单重复确认同样零副作用（复用 4.2 的 PAID 短路）；
-- 没有新增迟到用量时差额为 0，**不会凭空生成调整单**。
+- 没有新增迟到用量时差额为 0，**不会凭空生成调整单**；
+- 调整单金额与 `adjustmentDetail` 在生成时一次性落盘后冻结：收款成功、进入催收
+  或到达终态后，任何后续补报只会产生新的调整单，已计入的应收口径不被改写。
 
 对账（`BillingService.reconcile(subscriptionId, periodStart)`）：
 
@@ -187,7 +202,7 @@ FAILED 再重试-> RETRY_EXHAUSTED
 # 编译
 mvn -q -DskipTests compile
 
-# 运行全部单元测试（28 个用例，秒级完成）
+# 运行全部单元测试（30 个用例，秒级完成）
 mvn test
 
 # 只看某个测试类
@@ -208,7 +223,7 @@ mvn -q exec:java -Dexec.mainClass=com.github.highcumontoa.subscriptionbillingjav
 | `UsageServiceTest` | 重复事件、乱序、迟到补报、非法输入、8 线程并发同一 eventId |
 | `BillingServiceTest` | 额度内/超用/周期中升级账单、总额守恒、账期唯一、重复确认仅扣款一次 |
 | `DunningServiceTest` | 首跳失败入催收、未到期拒绝、到期重试成功后幂等、重试耗尽 FAILED |
-| `LateUsageAdjustmentTest` | 结清后补报生成补差并收款、对账差额为零、重复/并发触发不重复计费、未结清账期重算与汇总一致、无新增不生成、超窗拒绝 |
+| `LateUsageAdjustmentTest` | 结清后补报生成补差（含新增用量/计价切片/逐笔明细）并收款、多笔补报跨阶梯合并一单、对账差额为零、重复/并发触发不重复计费、未结清账期重算与汇总一致、催收中调整单不被改写、无新增不生成、超窗拒绝 |
 
 > 说明：核心域服务是无 Spring 依赖的普通 Java 类，测试用 `ManualClock`
 > 固定/推进时间，保证所有结论确定、可复现。

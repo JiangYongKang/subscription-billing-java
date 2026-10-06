@@ -25,6 +25,44 @@ public final class Invoice {
                               List<String> basisEventIds) {
     }
 
+    /**
+     * 补差调整单中一条来源补报记录的逐笔明细：事件 id、发生时间、新增用量，
+     * 以及该笔记录在本次补差中贡献的费用（按发生时间排序后逐笔边际计价，
+     * 各笔 feeCents 之和恒等于调整单总额）。
+     */
+    public record AdjustmentLine(String eventId, long occurredAt,
+                                 long quantity, long feeCents) {
+    }
+
+    /**
+     * 补差计价的一段阶梯切片：本次新增超用量落在
+     * (fromOverageUnitExclusive, toOverageUnitInclusive] 区间的 units 个单位，
+     * 按 unitPriceCents 单价计得 feeCents。各切片 units 之和 = 新增超用量，
+     * feeCents 之和 = 调整单总额，计价规则可逐段核对。
+     */
+    public record PricingSlice(long fromOverageUnitExclusive,
+                               long toOverageUnitInclusive,
+                               long units, long unitPriceCents, long feeCents) {
+    }
+
+    /**
+     * 补差调整单的完整核对明细（仅 ADJUSTMENT 账单携带）：
+     * <ul>
+     *   <li>addedUnits：本次补报新增的总用量；</li>
+     *   <li>overageBeforeUnits/overageAfterUnits：补报前/后的账期超用量
+     *       （相对原账单冻结的包含额度）；</li>
+     *   <li>pricingSlices：新增超用量按账期计费套餐阶梯展开的计价切片；</li>
+     *   <li>lines：逐笔来源补报记录及其费用贡献。</li>
+     * </ul>
+     * 守恒不变量：Σ lines.quantity = addedUnits；Σ lines.feeCents
+     * = Σ pricingSlices.feeCents = 调整单 totalCents。
+     */
+    public record AdjustmentDetail(String planCode, long addedUnits,
+                                   long overageBeforeUnits, long overageAfterUnits,
+                                   List<PricingSlice> pricingSlices,
+                                   List<AdjustmentLine> lines) {
+    }
+
     private String id;
     private String subscriptionId;
     private long periodStart;
@@ -44,6 +82,8 @@ public final class Invoice {
     private String linkedInvoiceId;
     /** 仅 ADJUSTMENT：本次补差覆盖的迟到补报事件 id（可逐个核对来源）。 */
     private List<String> sourceEventIds = new ArrayList<>();
+    /** 仅 ADJUSTMENT：新增用量、计价规则切片与逐笔来源明细（业务对账依据）。 */
+    private AdjustmentDetail adjustmentDetail;
     /** 仅 REGULAR：生成/最近一次重算时已计入账单的事件 id（补差覆盖判定的依据）。 */
     private List<String> billedEventIds = new ArrayList<>();
     /** 仅 REGULAR 未结清期间：迟到补报触发的重算审计轨迹。 */
@@ -79,6 +119,10 @@ public final class Invoice {
     public String getLinkedInvoiceId() { return linkedInvoiceId; }
     public void setLinkedInvoiceId(String linkedInvoiceId) { this.linkedInvoiceId = linkedInvoiceId; }
     public List<String> getSourceEventIds() { return sourceEventIds; }
+    public AdjustmentDetail getAdjustmentDetail() { return adjustmentDetail; }
+    public void setAdjustmentDetail(AdjustmentDetail adjustmentDetail) {
+        this.adjustmentDetail = adjustmentDetail;
+    }
     public List<String> getBilledEventIds() { return billedEventIds; }
     public List<RecalcAudit> getRecalcAudits() { return recalcAudits; }
 }
